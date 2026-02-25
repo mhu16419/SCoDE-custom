@@ -1,5 +1,5 @@
-# Steer Your Model: A Contrastive Decoding Approach for Secure Code Generation
-This is the official repository for ''Steer Your Model: A Contrastive Decoding Approach for Secure Code Generation''.
+# Steer Your Model: Secure Code Generation with Contrastive Decoding
+This is the official repository for ''Steer Your Model: Secure Code Generation with Contrastive Decoding''.
 
 ## Setup
 First, install Python dependencies:
