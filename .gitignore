@@ -3,3 +3,6 @@ codeql/
 __pycache__/
 *.pyc
 trained/
+data_eval/
+data_train_val/
+experiments/

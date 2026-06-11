@@ -15,10 +15,8 @@ from collections import OrderedDict
 
 from safecoder.utils import set_logging, set_seed, get_cp_args
 from safecoder.constants import PRETRAINED_MODELS, CHAT_MODELS, CWES_TRAINED, NEW_EVALS, NOT_TRAINED
-from safecoder.evaler import EvalerCodePLM, EvalerCodeFT, EvalerOpenAI, EvalerChat, \
-    EvalerCodeSTEER, EvalerText, \
-    EvalerCodeSTEERFull, EvalerCodeSTEERSTD, \
-    EvalerCodeCOSEC
+from safecoder.evaler import EvalerCodePLM, EvalerCodeFT, EvalerOpenAI, EvalerChat, EvalerCodeSTEER, EvalerCodeCOSEC
+from safecoder.reward import RewardScorer, reward_guided_enabled, write_reward_records
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -35,6 +33,16 @@ def get_args():
     parser.add_argument('--temp', type=float, default=0.4)
     parser.add_argument('--max_gen_len', type=int, default=256)
     parser.add_argument('--top_p', type=float, default=0.95)
+
+    # reward-guided candidate selection and repair
+    parser.add_argument('--reward_guided', action='store_true')
+    parser.add_argument('--candidate_multiplier', type=int, default=1)
+    parser.add_argument('--repair_rounds', type=int, default=0)
+    parser.add_argument('--repair_memory_size', type=int, default=3)
+    parser.add_argument('--reward_model_path', type=str, default=None)
+    parser.add_argument('--reward_weights', type=str, default=None)
+    parser.add_argument('--reward_max_length', type=int, default=512)
+    parser.add_argument('--reward_batch_size', type=int, default=8)
 
     parser.add_argument('--experiments_dir', type=str, default='../experiments/sec_eval')
     parser.add_argument('--data_dir', type=str, default='../data_eval/sec_eval')
@@ -69,6 +77,7 @@ def get_args():
         args.num_samples_per_gen = 10
     args.output_dir = os.path.join(args.experiments_dir, args.output_name, args.eval_type)
     args.data_dir = os.path.join(args.data_dir, args.eval_type)
+    args.reward_defer_selection = args.reward_guided
 
     return args
 
@@ -105,6 +114,129 @@ def codeql_analyze(info, db_dir, csv_path):
         subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL)
     else:
         raise NotImplementedError()
+
+
+def get_source_filename(info, index):
+    findex = f'{str(index).zfill(2)}'
+    if info['language'] == 'java':
+        return 'MyTestClass' + findex + '.' + info['language']
+    return findex + '.' + info['language']
+
+
+def prepare_source_for_filename(info, src, index):
+    if info['language'] == 'java':
+        class_name = 'MyTestClass' + f'{str(index).zfill(2)}'
+        return src.replace('public class MyTestClass', 'public class {}'.format(class_name), 1)
+    return src
+
+
+def write_source_dir(info, srcs, src_dir, output_dir, include_build_files):
+    os.makedirs(src_dir)
+    file_names = []
+    for i, src in enumerate(srcs):
+        fname = get_source_filename(info, i)
+        file_names.append(fname)
+        src = prepare_source_for_filename(info, src, i)
+        with open(os.path.join(src_dir, fname), 'w') as f:
+            f.write(src)
+
+    if include_build_files:
+        if info['language'] == 'c':
+            shutil.copy2('Makefile.c', os.path.join(src_dir, 'Makefile'))
+        elif info['language'] == 'java':
+            with open('compile_java.sh') as f:
+                makefile = f.read()
+            makefile = makefile.replace('CLASS_PATH', get_cp_args(info))
+            with open(os.path.join(src_dir, 'compile_java.sh'), 'w') as f:
+                f.write(makefile)
+        elif info['language'] == 'rb' and 'use_gemspec' in info and info['use_gemspec']:
+            shutil.copy2('test.gemspec', output_dir)
+    return file_names
+
+
+def collect_codeql_vuls(info, vul_type, src_dir, output_dir, csv_name='codeql.csv', db_name='codeql_db'):
+    vuls = set()
+    if not os.path.exists(src_dir) or len(os.listdir(src_dir)) == 0:
+        return vuls
+
+    csv_path = os.path.join(output_dir, csv_name)
+    db_dir = os.path.join(output_dir, db_name)
+    codeql_create_db(info, src_dir, db_dir)
+    codeql_analyze(info, db_dir, csv_path)
+    if vul_type == 'cwe-078' and info['language'] == 'py':
+        filter_cwe78_fps(src_dir, csv_path)
+    with open(csv_path) as csv_f:
+        reader = csv.reader(csv_f)
+        for row in reader:
+            if len(row) < 5:
+                continue
+            src_fname = row[-5].split('/')[-1]
+            vuls.add(src_fname)
+    return vuls
+
+
+def select_reward_guided_candidates(args, info, output_dir, vul_type, output_srcs, non_parsed_srcs):
+    candidate_dir = os.path.join(output_dir, 'candidate_srcs')
+    candidate_names = write_source_dir(info, output_srcs, candidate_dir, output_dir, include_build_files=True)
+    vuls = collect_codeql_vuls(
+        info,
+        vul_type,
+        candidate_dir,
+        output_dir,
+        csv_name='candidate_codeql.csv',
+        db_name='candidate_codeql_db',
+    ) if len(output_srcs) > 0 else set()
+
+    sources = list(output_srcs) + list(non_parsed_srcs)
+    parse_results = [True] * len(output_srcs) + [False] * len(non_parsed_srcs)
+    source_names = candidate_names + [None] * len(non_parsed_srcs)
+    codeql_warnings = [
+        (1 if name in vuls else 0) if name is not None else None
+        for name in source_names
+    ]
+
+    scorer = RewardScorer(args)
+    scores = scorer.score_sources(
+        sources,
+        info,
+        parse_results=parse_results,
+        codeql_warnings=codeql_warnings,
+    )
+    selected_indices = scorer.select_top_indices(scores, args.num_samples)
+    selected = set(selected_indices)
+
+    reward_records = []
+    final_output_srcs, final_non_parsed_srcs = [], []
+    final_vul_count = 0
+    for idx, (src, parsed, name, warnings, score) in enumerate(zip(
+        sources,
+        parse_results,
+        source_names,
+        codeql_warnings,
+        scores,
+    )):
+        record = {
+            'candidate_index': idx,
+            'source_file': name,
+            'parsed': parsed,
+            'selected': idx in selected,
+        }
+        record.update(score.to_dict())
+        reward_records.append(record)
+
+        if idx not in selected:
+            continue
+        if parsed:
+            final_output_srcs.append(src)
+            if warnings is not None and warnings > 0:
+                final_vul_count += 1
+        else:
+            final_non_parsed_srcs.append(src)
+
+    for rank, idx in enumerate(selected_indices):
+        reward_records[idx]['selected_rank'] = rank
+    write_reward_records(os.path.join(output_dir, 'reward_scores.jsonl'), reward_records)
+    return final_output_srcs, final_non_parsed_srcs, final_vul_count
     
 class CWE78Visitor(cst.CSTVisitor):
     METADATA_DEPENDENCIES = (PositionProvider,)
@@ -185,53 +317,34 @@ def eval_scenario(args, evaler, vul_type, scenario):
         func_context = f.read()
     output_srcs, non_parsed_srcs = evaler.sample(file_context, func_context, info)
 
-    for srcs, name in [(output_srcs, 'output_srcs'), (non_parsed_srcs, 'non_parsed_srcs')]:
-        src_dir = os.path.join(output_dir, name)
-        os.makedirs(src_dir)
-        for i, src in enumerate(srcs):
-            findex = f'{str(i).zfill(2)}'
-            if info['language'] == 'java':
-                class_name = 'MyTestClass' + findex
-                fname = class_name + '.' + info['language']
-                src = src.replace('public class MyTestClass', 'public class {}'.format(class_name), 1)
-            else:
-                fname = findex + '.' + info['language']
-            with open(os.path.join(src_dir, fname), 'w') as f:
-                f.write(src)
-        if name == 'output_srcs':
-            if info['language'] == 'c':
-                shutil.copy2('Makefile.c', os.path.join(src_dir, 'Makefile'))
-            elif info['language'] == 'java':
-                with open('compile_java.sh') as f:
-                    makefile = f.read()
-                makefile = makefile.replace('CLASS_PATH', get_cp_args(info))
-                with open(os.path.join(src_dir, 'compile_java.sh'), 'w') as f:
-                    f.write(makefile)
-            elif info['language'] == 'rb' and 'use_gemspec' in info and info['use_gemspec']:
-                shutil.copy2('test.gemspec', output_dir)
-
-    vuls = set()
-    if len(output_srcs) != 0:
-        src_dir = os.path.join(output_dir, 'output_srcs')
-        csv_path = os.path.join(output_dir, 'codeql.csv')
-        db_dir = os.path.join(output_dir, 'codeql_db')
-        codeql_create_db(info, src_dir, db_dir)
-        codeql_analyze(info, db_dir, csv_path)
-        if vul_type == 'cwe-078' and info['language'] == 'py':
-            filter_cwe78_fps(src_dir, csv_path)
-        with open(csv_path) as csv_f:
-            reader = csv.reader(csv_f)
-            for row in reader:
-                if len(row) < 5: continue
-                src_fname = row[-5].split('/')[-1]
-                vuls.add(src_fname)
+    if reward_guided_enabled(args):
+        output_srcs, non_parsed_srcs, vul_count = select_reward_guided_candidates(
+            args,
+            info,
+            output_dir,
+            vul_type,
+            output_srcs,
+            non_parsed_srcs,
+        )
+        write_source_dir(info, output_srcs, os.path.join(output_dir, 'output_srcs'), output_dir, include_build_files=True)
+        write_source_dir(info, non_parsed_srcs, os.path.join(output_dir, 'non_parsed_srcs'), output_dir, include_build_files=False)
+    else:
+        write_source_dir(info, output_srcs, os.path.join(output_dir, 'output_srcs'), output_dir, include_build_files=True)
+        write_source_dir(info, non_parsed_srcs, os.path.join(output_dir, 'non_parsed_srcs'), output_dir, include_build_files=False)
+        vuls = collect_codeql_vuls(
+            info,
+            vul_type,
+            os.path.join(output_dir, 'output_srcs'),
+            output_dir,
+        ) if len(output_srcs) != 0 else set()
+        vul_count = len(vuls)
 
     d = OrderedDict()
     d['vul_type'] = vul_type
     d['scenario'] = scenario
     d['total'] = len(output_srcs)
-    d['sec'] = len(output_srcs) - len(vuls)
-    d['vul'] = len(vuls)
+    d['sec'] = len(output_srcs) - vul_count
+    d['vul'] = vul_count
     d['non_parsed'] = len(non_parsed_srcs)
     d['model_name'] = args.model_name
     d['temp'] = args.temp

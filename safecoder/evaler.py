@@ -1,16 +1,21 @@
 import os
 import re
 import abc
-import openai
 import numpy as np
 import torch
 import torch.nn as nn
+
+try:
+    import openai
+except ImportError:
+    openai = None
 
 
 from .utils import load_model, set_seed, try_parse
 from .constants import PROMPT_NO_INPUT, INSTRUCTION, LANGUAGE_MAPS, PRETRAINED_MODELS
 from .constants import SECURE_PROMPTING_GENERIC, SECURE_PROMPTING_SPECIFIC, CWE_DESCRIPTIONS
 from .constants import SECURE_PROMPTING, INSECURE_PROMPTING
+from .reward import RewardScorer, build_repair_prompt, candidate_budget, reward_guided_enabled
 from steer.steer_models import Steer
 
 import time
@@ -36,42 +41,86 @@ class EvalerBase:
     def __init__(self, args):
         self.args = args
         self.tokenizer, self.model = load_model(args.model_name, args)
+        self.reward_scorer = None
+
+    def _get_reward_scorer(self):
+        if getattr(self, 'reward_scorer', None) is None:
+            self.reward_scorer = RewardScorer(self.args)
+        return self.reward_scorer
+
+    def _generation_budget(self):
+        if reward_guided_enabled(self.args):
+            return candidate_budget(self.args)
+        return self.args.num_samples
+
+    def _generation_rounds(self):
+        if not reward_guided_enabled(self.args):
+            return 1
+        return max(0, int(getattr(self.args, 'repair_rounds', 0))) + 1
+
+    def _num_batches(self, budget):
+        per_gen = max(1, int(self.args.num_samples_per_gen))
+        return max(1, (budget + per_gen - 1) // per_gen)
+
+    def _repair_memory(self, sources, info):
+        if len(sources) == 0:
+            return []
+        scorer = self._get_reward_scorer()
+        scores = scorer.score_sources(sources, info)
+        return scorer.build_repair_memory(scores, int(getattr(self.args, 'repair_memory_size', 3)))
+
+    def _finalize_sources(self, sources, info):
+        if reward_guided_enabled(self.args) and not getattr(self.args, 'reward_defer_selection', False):
+            scorer = self._get_reward_scorer()
+            scores = scorer.score_sources(sources, info)
+            selected = scorer.select_top_indices(scores, self.args.num_samples)
+            sources = [sources[idx] for idx in selected]
+
+        output_srcs, non_parsed_srcs = [], []
+        for src in sources:
+            if info['language'] != 'go' and try_parse(src, info) != 0:
+                non_parsed_srcs.append(src)
+            else:
+                output_srcs.append(src)
+        return output_srcs, non_parsed_srcs
 
     def sample(self, file_context, func_context, info):
         prompt = self.preprocess(file_context, func_context, info)
-        input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.model.device)
-        input_ids_len = input_ids.size(1)
-        output_srcs, non_parsed_srcs = [], []
+        output_candidates, memory = [], []
 
-        for i in range(self.args.num_samples // self.args.num_samples_per_gen):
-            set_seed(self.args.seed+i)
+        for repair_round in range(self._generation_rounds()):
+            cur_prompt = build_repair_prompt(prompt, memory) if memory else prompt
+            input_ids = self.tokenizer.encode(cur_prompt, return_tensors='pt').to(self.model.device)
+            input_ids_len = input_ids.size(1)
 
-            gen_output = self.model.generate(
-                input_ids,
-                do_sample=True,
-                num_return_sequences=self.args.num_samples_per_gen,
-                temperature=self.args.temp,
-                max_new_tokens=self.args.max_gen_len,
-                top_p=self.args.top_p,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-            )
+            for i in range(self._num_batches(self._generation_budget())):
+                set_seed(self.args.seed + repair_round * 1000 + i)
 
-            tokens = gen_output[:, input_ids_len:, ...]
-            completions = self.tokenizer.batch_decode(tokens)
-            for completion in completions:
-                if self.tokenizer.eos_token in completion:
-                    completion = completion[:completion.find(self.tokenizer.eos_token)]
-                completion = self.postprocess(completion, info)
-                output_src = file_context + func_context + completion
-                output_src = output_src.rstrip() + '\n'
-                if info['language'] != 'go' and try_parse(output_src, info) != 0:
-                    non_parsed_srcs.append(output_src)
-                else:
-                    output_srcs.append(output_src)
+                gen_output = self.model.generate(
+                    input_ids,
+                    do_sample=True,
+                    num_return_sequences=self.args.num_samples_per_gen,
+                    temperature=self.args.temp,
+                    max_new_tokens=self.args.max_gen_len,
+                    top_p=self.args.top_p,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                )
 
-        return output_srcs, non_parsed_srcs
+                tokens = gen_output[:, input_ids_len:, ...]
+                completions = self.tokenizer.batch_decode(tokens)
+                for completion in completions:
+                    if self.tokenizer.eos_token in completion:
+                        completion = completion[:completion.find(self.tokenizer.eos_token)]
+                    completion = self.postprocess(completion, info)
+                    output_src = file_context + func_context + completion
+                    output_candidates.append(output_src.rstrip() + '\n')
+
+            if repair_round + 1 < self._generation_rounds():
+                memory = self._repair_memory(output_candidates, info)
+
+        return self._finalize_sources(output_candidates, info)
 
     @abc.abstractclassmethod
     def preprocess(self, file_context, func_context, info):
@@ -219,6 +268,8 @@ class EvalerChat(EvalerBase):
 
 class EvalerOpenAI(EvalerBase):
     def __init__(self, args):
+        if openai is None:
+            raise ImportError('The openai package is required for EvalerOpenAI.')
         self.args = args
         self.model = args.model_name
         self.client = openai.OpenAI()
@@ -240,30 +291,28 @@ class EvalerOpenAI(EvalerBase):
         prompt = PROMPT_NO_INPUT.format_map({'instruction': instruction})
         prompt += file_context+func_context
 
-        srcs = []
-        for i in range(self.args.num_samples // self.args.num_samples_per_gen):
-            response = self.client.completions.create(
-                model=self.model,
-                prompt=prompt,
-                n=self.args.num_samples_per_gen,
-                temperature=self.args.temp,
-                max_tokens=self.args.max_gen_len,
-                top_p=self.args.top_p,
-                seed=self.args.seed+i
-            )
-            for choice in response.choices:
-                completion = choice.text
-                completion = self.postprocess(completion, info)
-                srcs.append(file_context+func_context+completion)
+        srcs, memory = [], []
+        for repair_round in range(self._generation_rounds()):
+            cur_prompt = build_repair_prompt(prompt, memory) if memory else prompt
+            for i in range(self._num_batches(self._generation_budget())):
+                response = self.client.completions.create(
+                    model=self.model,
+                    prompt=cur_prompt,
+                    n=self.args.num_samples_per_gen,
+                    temperature=self.args.temp,
+                    max_tokens=self.args.max_gen_len,
+                    top_p=self.args.top_p,
+                    seed=self.args.seed + repair_round * 1000 + i
+                )
+                for choice in response.choices:
+                    completion = choice.text
+                    completion = self.postprocess(completion, info)
+                    srcs.append((file_context + func_context + completion).rstrip() + '\n')
 
-        output_srcs, non_parsed_srcs = [], []
-        for src in srcs:
-            if info['language'] != 'go' and try_parse(src, info) != 0:
-                non_parsed_srcs.append(src)
-            else:
-                output_srcs.append(src)
+            if repair_round + 1 < self._generation_rounds():
+                memory = self._repair_memory(srcs, info)
 
-        return output_srcs, non_parsed_srcs
+        return self._finalize_sources(srcs, info)
 
 
 class EvalerCodeSTEER(EvalerCodeFT):
@@ -289,40 +338,42 @@ class EvalerCodeSTEER(EvalerCodeFT):
 
     def sample(self, file_context, func_context, info):
         prompt = self.preprocess(file_context, func_context, info)
-        input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.model.device)
-        input_ids_len = input_ids.size(1)
-        output_srcs, non_parsed_srcs = [], []
+        output_candidates, memory = [], []
 
-        for i in range(self.args.num_samples // self.args.num_samples_per_gen):
-            set_seed(self.args.seed+i)
+        for repair_round in range(self._generation_rounds()):
+            cur_prompt = build_repair_prompt(prompt, memory) if memory else prompt
+            input_ids = self.tokenizer.encode(cur_prompt, return_tensors='pt').to(self.model.device)
+            input_ids_len = input_ids.size(1)
 
-            gen_output = self.model.generate(
-                input_ids,
-                steer_values=list(map(float, self.args.steer_values)) if self.args.steer_values is not None else None,
-                do_sample=True,
-                num_return_sequences=self.args.num_samples_per_gen,
-                temperature=self.args.temp,
-                max_new_tokens=self.args.max_gen_len,
-                top_p=self.args.top_p,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-            )
+            for i in range(self._num_batches(self._generation_budget())):
+                set_seed(self.args.seed + repair_round * 1000 + i)
 
-            tokens = gen_output[:, input_ids_len:, ...]
-            completions = self.tokenizer.batch_decode(tokens)
-            for completion in completions:
-                if self.tokenizer.eos_token in completion:
-                    completion = completion[:completion.find(self.tokenizer.eos_token)]
-                completion = self.postprocess(completion, info)
-                output_src = file_context + func_context + completion
-                output_src = output_src.rstrip() + '\n'
-                if info['language'] != 'go' and try_parse(output_src, info) != 0:
-                    non_parsed_srcs.append(output_src)
-                else:
-                    output_srcs.append(output_src)
-        
-        return output_srcs, non_parsed_srcs
+                gen_output = self.model.generate(
+                    input_ids,
+                    steer_values=list(map(float, self.args.steer_values)) if self.args.steer_values is not None else None,
+                    do_sample=True,
+                    num_return_sequences=self.args.num_samples_per_gen,
+                    temperature=self.args.temp,
+                    max_new_tokens=self.args.max_gen_len,
+                    top_p=self.args.top_p,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                )
+
+                tokens = gen_output[:, input_ids_len:, ...]
+                completions = self.tokenizer.batch_decode(tokens)
+                for completion in completions:
+                    if self.tokenizer.eos_token in completion:
+                        completion = completion[:completion.find(self.tokenizer.eos_token)]
+                    completion = self.postprocess(completion, info)
+                    output_src = file_context + func_context + completion
+                    output_candidates.append(output_src.rstrip() + '\n')
+
+            if repair_round + 1 < self._generation_rounds():
+                memory = self._repair_memory(output_candidates, info)
+
+        return self._finalize_sources(output_candidates, info)
 
 
 class EvalerCodeCOSEC(EvalerCodeFT):
@@ -359,47 +410,48 @@ class EvalerCodeCOSEC(EvalerCodeFT):
 
     def sample(self, file_context, func_context, info):
         prompt = self.preprocess(file_context, func_context, info)
-        input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.model.device)
-        input_ids_len = input_ids.size(1)
-        output_srcs, non_parsed_srcs = [], []
+        output_candidates, memory = [], []
 
-        for i in range(self.args.num_samples // self.args.num_samples_per_gen):
-            set_seed(self.args.seed+i)
-            kwargs = {
-                'expert': True,
-                'expert_lm': self.sec_model,
-                'model_kwargs_expert': {},
-                'threshold': self.args.threshold,
-            }
+        for repair_round in range(self._generation_rounds()):
+            cur_prompt = build_repair_prompt(prompt, memory) if memory else prompt
+            input_ids = self.tokenizer.encode(cur_prompt, return_tensors='pt').to(self.model.device)
+            input_ids_len = input_ids.size(1)
 
-            gen_output = self.model.generate_with_experts(
-                input_ids,
-                do_sample=True,
-                num_return_sequences=self.args.num_samples_per_gen,
-                temperature=self.args.temp,
-                max_new_tokens=self.args.max_gen_len,
-                top_p=self.args.top_p,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-                expert_min_prob=0.0,
-                expert_temperature=self.args.exp_temp,
-                expert_top_p=0.95,
-                **kwargs
-            )
+            for i in range(self._num_batches(self._generation_budget())):
+                set_seed(self.args.seed + repair_round * 1000 + i)
+                kwargs = {
+                    'expert': True,
+                    'expert_lm': self.sec_model,
+                    'model_kwargs_expert': {},
+                    'threshold': self.args.threshold,
+                }
 
-            tokens = gen_output[:, input_ids_len:, ...]
-            completions = self.tokenizer.batch_decode(tokens)
-            for completion in completions:
-                if self.tokenizer.eos_token in completion:
-                    completion = completion[:completion.find(self.tokenizer.eos_token)]
-                completion = self.postprocess(completion, info)
-                output_src = file_context + func_context + completion
-                output_src = output_src.rstrip() + '\n'
-                if info['language'] != 'go' and try_parse(output_src, info) != 0:
-                    non_parsed_srcs.append(output_src)
-                else:
-                    output_srcs.append(output_src)
+                gen_output = self.model.generate_with_experts(
+                    input_ids,
+                    do_sample=True,
+                    num_return_sequences=self.args.num_samples_per_gen,
+                    temperature=self.args.temp,
+                    max_new_tokens=self.args.max_gen_len,
+                    top_p=self.args.top_p,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
+                    expert_min_prob=0.0,
+                    expert_temperature=self.args.exp_temp,
+                    expert_top_p=0.95,
+                    **kwargs
+                )
 
-        
-        return output_srcs, non_parsed_srcs
+                tokens = gen_output[:, input_ids_len:, ...]
+                completions = self.tokenizer.batch_decode(tokens)
+                for completion in completions:
+                    if self.tokenizer.eos_token in completion:
+                        completion = completion[:completion.find(self.tokenizer.eos_token)]
+                    completion = self.postprocess(completion, info)
+                    output_src = file_context + func_context + completion
+                    output_candidates.append(output_src.rstrip() + '\n')
+
+            if repair_round + 1 < self._generation_rounds():
+                memory = self._repair_memory(output_candidates, info)
+
+        return self._finalize_sources(output_candidates, info)
