@@ -1,0 +1,5 @@
+codeql-linux64.zip
+codeql/
+__pycache__/
+*.pyc
+trained/
